@@ -1,0 +1,95 @@
+#!/usr/bin/env ruby
+require 'eventmachine'
+require 'fraggel'
+
+def proxies
+  Thread.current[:proxies] ||= {}
+end
+
+module FraggelExt
+  # Watch and Walk
+  # This will return both opids in that order
+  def waw(glob, &blk)
+    [
+      watch(glob, &blk),
+      walk(glob) do |path, body, cas, err|
+        # We don't care when WALK is over; we want the
+        # two operations blend together.
+        if err != :done
+          blk.call(path, body, cas, err)
+        end
+      end
+    ]
+  end
+end
+
+EM.run do
+  # In the near future, this will take mutilple address
+  # for attempts to find a peer.
+  c = Fraggel.connect 8041
+
+  # Print exceptions
+  c.errback {|err| p [:error, err] }
+
+  # Give Mama some sugar
+  c.extend FraggelExt
+
+  ## We will soon need to establish a session to lock things
+  # c.session!
+
+  ## Our Tree
+  # NOTE: /lock isn't special in doozer yet, but we can still use it now.
+  #       Doozer just won't release our locks if we die.
+  # /
+  #   lock/
+  #     proc/
+  #       <id>/
+  #         owner=<session> # Where the backend lives
+  #         proxy=<session> # Where the proxy lives
+  #   proc/
+  #     <id>/
+  #       addr=<host:port>  # Where to bind to the backend
+  #       proxy=<host:port> # Where to bind to the proxy
+  #
+  c.waw "/lock/proc/*/proxy" do |path, body, cas, err|
+    case true
+    when err == :done
+      # TODO: Do something (maybe close all proxies)
+    when cas.del?
+      pid = path.split("/")[2]
+      if proxy = proxies.delete(pid)
+        proxy.close_connection
+      end
+
+    when cas.set?
+      # We are the ones who set it, ignore.
+      next if body == c.id
+
+      # No one has a hold of this yet, let's try to get it.
+      client.set path, client.id, cas do |cas, err|
+        if err != nil
+          # TODO: Do something
+        else
+          pid = path.split("/")[2]
+          c.get "/proc/"+pid+"/addr" do |addr, cas, err|
+            pid = pid # hack to pass handle down
+
+            if err != nil
+              # TODO: do something
+            else
+              proxy = Proxy.create(addr)
+              c.set "/proc/"+id+"/proxy", proxy.addr, :clobber do |cas, err|
+                if err != nil
+                  proxy.close_connection
+                  raise err
+                else
+                  proxies[pid] = proxy
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
