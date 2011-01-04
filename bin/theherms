@@ -132,7 +132,7 @@ EM.run do
 
                   c.set "/proc/"+that+"/proxy", addr(proxy), :clobber do |cas, err|
                     if err != nil
-                      proxy.close_connection
+                      EM.stop_server(proxy)
                       raise err
                     else
                       proxies[that] = proxy
