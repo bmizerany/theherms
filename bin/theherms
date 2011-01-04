@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 require 'eventmachine'
 require 'fraggel'
+require 'socket'
 
 def proxies
   Thread.current[:proxies] ||= {}
@@ -21,7 +22,42 @@ module FraggelExt
       end
     ]
   end
+
+  def id
+    object_id.to_s
+  end
+
 end
+
+
+module Proxy
+
+  def self.create(host, port)
+    EM.start_server("0.0.0.0", 0, self, host, port)
+  end
+
+  def initialize(host, port)
+    @host, @port = host, port
+  end
+
+  def post_init
+    p [:connection!, @host, @port]
+    to = EM.connect(@host, @port)
+    EM.enable_proxy(self, to)
+    EM.enable_proxy(to, self)
+  end
+
+  def proxy_target_unbound
+    p [:target_unbound, @host, @port]
+  end
+
+end
+
+def addr(sid)
+  port, ip = Socket.unpack_sockaddr_in(EM.get_sockname(sid))
+  [ip, port].join(":")
+end
+
 
 EM.run do
   # In the near future, this will take mutilple address
@@ -29,13 +65,20 @@ EM.run do
   c = Fraggel.connect 8041
 
   # Print exceptions
-  c.errback {|err| p [:error, err] }
+  EM.error_handler do |err|
+    c.close_connection
+    puts
+    puts err.message+"  \n"+err.backtrace.join("  \n")
+  end
+
 
   # Give Mama some sugar
   c.extend FraggelExt
 
+
   ## We will soon need to establish a session to lock things
   # c.session!
+
 
   ## Our Tree
   # NOTE: /lock isn't special in doozer yet, but we can still use it now.
@@ -51,10 +94,13 @@ EM.run do
   #       addr=<host:port>  # Where to bind to the backend
   #       proxy=<host:port> # Where to bind to the proxy
   #
-  c.waw "/lock/proc/*/proxy" do |path, body, cas, err|
+  c.watch "/lock/proc/*/proxy" do |path, session, cas, err|
+    p [:noticed, path, session]
     case true
     when err == :done
       # TODO: Do something (maybe close all proxies)
+    when err != nil
+      raise err
     when cas.del?
       pid = path.split("/")[2]
       if proxy = proxies.delete(pid)
@@ -63,27 +109,37 @@ EM.run do
 
     when cas.set?
       # We are the ones who set it, ignore.
-      next if body == c.id
+      if session != c.id
 
-      # No one has a hold of this yet, let's try to get it.
-      client.set path, client.id, cas do |cas, err|
-        if err != nil
-          # TODO: Do something
-        else
-          pid = path.split("/")[2]
-          c.get "/proc/"+pid+"/addr" do |addr, cas, err|
-            pid = pid # hack to pass handle down
+        # No one has a hold of this yet, let's try to get it.
+        c.set path, c.id.to_s, cas do |cas, err|
+          if err != nil
+            # TODO: Do something
+            raise err
+          else
+            pid = path.split("/")[3]
+            p [:got, pid]
 
-            if err != nil
-              # TODO: do something
-            else
-              proxy = Proxy.create(addr)
-              c.set "/proc/"+id+"/proxy", proxy.addr, :clobber do |cas, err|
-                if err != nil
-                  proxy.close_connection
-                  raise err
+            c.get "/proc/"+pid+"/addr" do |addr, cas, err|
+
+              if err != nil
+                raise err
+              else
+                # TODO: no longer assume addr exists
+                if cas != "0"
+                  that  = pid
+                  proxy = Proxy.create(*addr[0].split(":"))
+
+                  c.set "/proc/"+that+"/proxy", addr(proxy), :clobber do |cas, err|
+                    if err != nil
+                      proxy.close_connection
+                      raise err
+                    else
+                      proxies[that] = proxy
+                    end
+                  end
                 else
-                  proxies[pid] = proxy
+                  puts that.to_s + " is missing addr"
                 end
               end
             end
